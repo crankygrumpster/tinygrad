@@ -10,19 +10,6 @@ from tinygrad.runtime.ops_gpu import ROCM_LLVM_PATH
 from extra.helpers import enable_early_exec
 early_exec = enable_early_exec()
 
-boilerplate_start = """
-.global _start
-_start:
-.rodata
-.align 0x10
-.global code.kd
-.type code.kd,STT_OBJECT
-.amdhsa_kernel code"""
-
-code_start = """.end_amdhsa_kernel
-.text
-code:
-"""
 
 # https://github.com/RadeonOpenCompute/ROCm_Documentation/blob/master/ROCm_Compiler_SDK/ROCm-Codeobj-format.rst
 # https://github.com/ROCm-Developer-Tools/ROCm-ComputeABI-Doc/blob/master/AMDGPU-ABI.md#initial-kernel-register-state
@@ -214,14 +201,31 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
     metadata = {'amdhsa.kernels': [{'.args': args,
                   '.group_segment_fixed_size': 0, '.kernarg_segment_align': 8, '.kernarg_segment_size': args[-1][".offset"] + args[-1][".size"],
                   '.language': 'OpenCL C', '.language_version': [1, 2], '.max_flat_workgroup_size': 256,
-                  '.name': 'code', '.private_segment_fixed_size': 0, '.sgpr_count': s_cnt, '.sgpr_spill_count': 0,
-                  '.symbol': 'code.kd', '.uses_dynamic_stack': False, '.vgpr_count': v_cnt, '.vgpr_spill_count': 0,
+                  '.name': function_name, '.private_segment_fixed_size': 0, '.sgpr_count': s_cnt, '.sgpr_spill_count': 0,
+                  '.symbol': f'{function_name}.kd', '.uses_dynamic_stack': False, '.vgpr_count': v_cnt, '.vgpr_spill_count': 0,
                   '.wavefront_size': 32}],
                 'amdhsa.target': 'amdgcn-amd-amdhsa--gfx1100', 'amdhsa.version': [1, 2]}
+
+    boilerplate_start = f"""
+.global _start
+_start:
+.rodata
+.align 0x10
+.global {function_name}.kd
+.type {function_name}.kd,STT_OBJECT
+.amdhsa_kernel {function_name}"""
+
+    code_start = f""".end_amdhsa_kernel
+.text
+{function_name}:
+"""
+
     
     code = boilerplate_start + "\n" + '\n'.join("%s %d" % x for x in kernel_desc.items()) + "\n" +  code_start + '\n'.join(ins) + "\n.amdgpu_metadata\n" + yaml.dump(metadata) + ".end_amdgpu_metadata"
+    print(code)
     obj = early_exec(([ROCM_LLVM_PATH / "llvm-mc", '--arch=amdgcn', '--mcpu=gfx1100', '--triple=amdgcn-amd-amdhsa', '--filetype=obj', '-'], code.encode("utf-8")))
     asm = early_exec(([ROCM_LLVM_PATH / "ld.lld", "/dev/stdin", "-o", "/dev/stdout", "--pie"], obj))
+    #exit()
     return asm
   
   
@@ -230,7 +234,8 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
   for i in range(param_cnt): args.append({'.address_space': 'global', '.name': f'data{i}', '.offset': i*8, '.size': 8, '.value_kind': 'global_buffer'})
   # '.type_name': b.dtype.name+"*"
 
-  return print(assemble(args, ins, v_cnt, s_cnt)) # "code"
+  return assemble(args, ins, v_cnt, s_cnt)
+  #return "code"
 
 
 def uops_to_rdna_asm(function_name:str, uops:List[UOp]) -> Tuple[str, List[int], List[int], bool]:
