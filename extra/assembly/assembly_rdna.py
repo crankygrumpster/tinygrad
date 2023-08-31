@@ -73,10 +73,16 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
       #print("clear")
       ins.append('s_waitcnt lgkmcnt(0), vmcnt(0)')
       pend_regs.clear()
-    return rtor[x]
+    #return rtor[x]
   def reg_out(x):
     return rtor[x]
   
+  
+  def rloadwait():
+    nonlocal pend_regs
+    if len(pend_regs) > 0:
+      ins.append('s_waitcnt lgkmcnt(0), vmcnt(0)')
+      pend_regs.clear()
 
   ############
   # register definitions
@@ -145,6 +151,8 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
       #else:
         #ins.append(f"{'s_' if out.scalar else 'v_'}mov_b32 {reg_out(out)}, {arg}")
     elif uop == UOps.ALU:
+      # wait for loads before doing
+      rloadwait()
       if arg in [BinaryOps.CMPLT]:
         ins.append(f"{'s' if out.scalar else 'v'}_{alu[arg]}_{dtype_to_rdnatype[out.dtype]} {', '.join(reg_in(x) if x.__class__ is Register else str(x) for x in vin)}")
       else:
@@ -173,6 +181,8 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
         ins.append(f's_mov_b32 {mytor[out]}, {arg}')
       elif vin[0].scalar:
         ins.append(f's_load_b32 {mytor[out]}, {mytor[vin[0]]}, {mytor[vin[1]]}')
+        pend_regs.add(out)
+        for r in out.subregs(): pend_regs.add(r)
       #elif out.scalar:
         # swap arg order
         #ins.append(f's_load_b32 {reg_out(out)}, {reg_in(vin[0])}, {reg_in(vin[1])}')
@@ -266,7 +276,7 @@ _start:
     print(code)
     obj = early_exec(([ROCM_LLVM_PATH / "llvm-mc", '--arch=amdgcn', '--mcpu=gfx1100', '--triple=amdgcn-amd-amdhsa', '--filetype=obj', '-'], code.encode("utf-8")))
     asm = early_exec(([ROCM_LLVM_PATH / "ld.lld", "/dev/stdin", "-o", "/dev/stdout", "--pie"], obj))
-    exit()
+    #exit()
     return asm
   
   
