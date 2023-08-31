@@ -23,21 +23,46 @@ class RDNALanguage(AssemblyLanguage):
 
 def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
   print(function_name)
-  print("INS",lang.ins)
+  print("INS",'\n'.join([str(x) for x in lang.ins]))
   print("CNTS",lang.cnts)
   print("TOR",lang.tor)
+  print("TOR scalars:", [(x,x.scalar) for x in lang.tor.values()])
 
   param_cnt=0
   ins = []
 
-  v_cnt = 3  # v[0:2] is local_xyz
-  s_cnt = 5  # s[0:1] is the address, s[2:4] is global_xyz
+  #v_cnt = 3  # v[0:2] is local_xyz
+  #s_cnt = 5  # s[0:1] is the address, s[2:4] is global_xyz
+  
+  v_cnt = 0
+  s_cnt = 2
 
   dtype_to_rdnatype = {dtypes.float32: "f32", dtypes.int64: "i64", dtypes.int32: "i32", dtypes.uint64: "u64", dtypes.bool: "i32"}
   alu = {BinaryOps.ADD: "add", BinaryOps.SUB: "sub", BinaryOps.MUL: "mul", TernaryOps.MULACC: "fma",
          BinaryOps.MAX: "max", UnaryOps.RECIP: "rcp",
          UnaryOps.NOOP: "mov", UnaryOps.SIN: "sin", UnaryOps.LOG2: "log", UnaryOps.EXP2: "exp",
          BinaryOps.CMPLT: "cmp_lt"}
+
+  # robert: creating registers on the fly
+  mytor:Dict[Register, str] = {}
+  
+  def rnew_reg(x, scalar=True):
+    print(f"new reg: {x}, {x.dtype}, {x.dtype.itemsize}")
+    nonlocal s_cnt, v_cnt
+    if scalar:
+      if x.dtype in [dtypes.float32, dtypes.int32, dtypes.uint32]:
+        ret = mytor[x] = f's{s_cnt}'
+        s_cnt += 1
+      else:
+        ret = mytor[x] = f's[{s_cnt}:{s_cnt+x.dtype.itemsize//4 - 1}]'
+        s_cnt += x.dtype.itemsize//4
+    else:
+      if x.dtype in [dtypes.float32, dtypes.int32, dtypes.uint32]:
+        ret = mytor[x] = f'v{v_cnt}'
+        v_cnt += 1
+      
+    return ret
+
 
   pend_regs:Set[Register] = set()
   rtor:Dict[Register, str] = {}
@@ -55,8 +80,8 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
 
   ############
   # register definitions
+  '''
   for arg in [(dtype, lang.type_to_letter(dtype), c) for dtype,c in lang.cnts.items()]:
-    #ins_prefix.append(f".reg .{dtype_to_nvtype[arg[0][0]]} %{arg[1]}<{arg[2]}>;",)
     # TODO: all in one loop
     if arg[0][0] in [dtypes.uint32, dtypes.uint64, dtypes.int64, dtypes.int32, dtypes.float32, dtypes._float4]:
       for i in range(arg[2]):
@@ -82,15 +107,19 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
         rtor[Register(f"%{arg[1]}{i}", *arg[0])] = reg_name
     else:
       raise NotImplementedError("DEFINE_REGISTER not implemented for arg: ", arg)
+  '''
   #########################################################
 
   
   for uop, out, vin, arg in lang.ins:
+    print('\n'.join(ins))
+    print("\n========================================")
+    print(f"{uop}, out={out}, vin={vin}, arg={arg}")
     if uop == UOps.SPECIAL:
       if arg.startswith('data'):
         param_cnt += 1
         i = int(arg[4:])
-        ins.append(f's_load_b64 {reg_out(out)}, s[0:1], {i*8}')
+        ins.append(f's_load_b64 {rnew_reg(out, scalar=True)}, s[0:1], {i*8}')
         pend_regs.add(out)
         for r in out.subregs(): pend_regs.add(r)
       elif arg.startswith('gid'):
@@ -126,21 +155,34 @@ def specialize_to_rdna(function_name, lang) -> str:  #Tuple[str, str]:
         if out.dtype == dtypes._float4:
           for rr in zip(*[x.subregs() if x.dtype == dtypes._float4 else [x,x,x,x] for x in [out]+vin]):
             ins.append(f"{'s_' if rr[0].scalar else 'v_'}{alu_arg}_{dtype_to_rdnatype[rr[0].dtype]} {reg_out(rr[0])}, {', '.join(reg_in(x) if x.__class__ is Register else str(x) for x in rr[1:])}")
+        if arg == UnaryOps.NOOP:
+          # variable offset register? see addr_w_offset in assembly.py
+          ins.append(f"s_mov_b32 {rnew_reg(out)}, {mytor[vin[0]]}")
         else:
-          ins.append(f"{'s_' if out.scalar else 'v_'}{alu_arg}_{dtype_to_rdnatype[out.dtype] if arg != UnaryOps.NOOP else 'b32'}{'_i24' if arg == BinaryOps.MUL and out.dtype != dtypes.float32 and not out.scalar else ''} {reg_out(out)}, {', '.join(reg_in(x) if x.__class__ is Register else str(x) for x in vin)}")
+          ins.append(f"v_{alu_arg}_{dtype_to_rdnatype[out.dtype]} {rnew_reg(out, scalar=False)}, {', '.join(mytor[v] for v in vin)}")
+        #else:
+          #ins.append(f"{'s_' if out.scalar else 'v_'}{alu_arg}_{dtype_to_rdnatype[out.dtype] if arg != UnaryOps.NOOP else 'b32'}{'_i24' if arg == BinaryOps.MUL and out.dtype != dtypes.float32 and not out.scalar else ''} {reg_out(out)}, {', '.join(reg_in(x) if x.__class__ is Register else str(x) for x in vin)}")
     elif uop == UOps.LOAD:
+      if out not in mytor:
+        if vin:
+          rnew_reg(out, scalar=vin[0].scalar)
+        else:
+          rnew_reg(out, scalar=True)
       # immediate
       if arg.__class__ in (int, float):
-        pass
-      elif out.scalar:
+        ins.append(f's_mov_b32 {mytor[out]}, {arg}')
+      elif vin[0].scalar:
+        ins.append(f's_load_b32 {mytor[out]}, {mytor[vin[0]]}, {mytor[vin[1]]}')
+      #elif out.scalar:
         # swap arg order
-        ins.append(f's_load_b32 {reg_out(out)}, {reg_in(vin[0])}, {reg_in(vin[1])} offset:{arg[0]}')
-      else:
-        ins.append(f'global_load_{"b128" if out.dtype == dtypes._float4 else "b32"} {reg_out(out)}, {reg_in(vin[1])}, {reg_in(vin[0])} offset:{arg[0]}')
+        #ins.append(f's_load_b32 {reg_out(out)}, {reg_in(vin[0])}, {reg_in(vin[1])}')
+      #else:
+        #ins.append(f'global_load_{"b128" if out.dtype == dtypes._float4 else "b32"} {reg_out(out)}, {reg_in(vin[0])}, {arg[0]}')
       pend_regs.add(out)
       for r in out.subregs(): pend_regs.add(r)
     elif uop == UOps.STORE:
-      ins.append(f'global_store_{"b128" if vin[1].dtype == dtypes._float4 else "b32"} {reg_in(vin[2])}, {reg_in(vin[1])}, {reg_in(vin[0])} offset:{arg[0]}')
+      ins.append(f'v_mov_b32_e32 {rnew_reg(vin[2], scalar=False)}, 0')
+      ins.append(f'global_store_{"b128" if vin[1].dtype == dtypes._float4 else "b32"} {mytor[vin[2]]}, {mytor[vin[1]]}, {mytor[vin[0]]}')
     elif uop == UOps.LABEL:
       ins.append(f"{arg}:")
     elif uop == UOps.COND_BRANCH:
@@ -220,12 +262,11 @@ _start:
 {function_name}:
 """
 
-    
     code = boilerplate_start + "\n" + '\n'.join("%s %d" % x for x in kernel_desc.items()) + "\n" +  code_start + '\n'.join(ins) + "\n.amdgpu_metadata\n" + yaml.dump(metadata) + ".end_amdgpu_metadata"
     print(code)
     obj = early_exec(([ROCM_LLVM_PATH / "llvm-mc", '--arch=amdgcn', '--mcpu=gfx1100', '--triple=amdgcn-amd-amdhsa', '--filetype=obj', '-'], code.encode("utf-8")))
     asm = early_exec(([ROCM_LLVM_PATH / "ld.lld", "/dev/stdin", "-o", "/dev/stdout", "--pie"], obj))
-    #exit()
+    exit()
     return asm
   
   
